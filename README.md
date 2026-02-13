@@ -1,34 +1,33 @@
-# usage-limits (OpenTUI)
+# xDIST (Did I Ship Today?)
 
-An htop-style CLI dashboard for tracking AI agent usage limits and costs.
+An htop-style CLI dashboard for tracking AI usage, limits, and costs across multiple providers.
 
-Built with:
+## Installation
 
-- Bun + TypeScript
-- OpenTUI (`@opentui/core`)
+```bash
+bun install -g xdist
+```
 
-## Features
+## Usage
 
-- htop-like terminal UI with colored progress bars
-- Multi-agent structure (GitHub Copilot, Codex, Claude, Z.ai, MiniMax, Vercel AI)
-- Theme switching
-- Settings page with per-agent enable toggles
-- Prompt-based credential setup when an enabled provider is not configured
-- Live GitHub premium request billing usage via:
-  - `GET /users/{username}/settings/billing/premium_request/usage?year=YYYY&month=MM`
-  - `GET /organizations/{org}/settings/billing/premium_request/usage?year=YYYY&month=MM` (set identity as `org:YOUR_ORG`)
-- Pay-as-you-go mode support (full bar + cost display)
+Simply run:
 
-## Quick start
+```bash
+xdist
+```
 
-1. Install dependencies
-   - `bun install`
-2. Fill `.env` (optional but recommended)
-   - `GITHUB_TOKEN`
-   - `GITHUB_USERNAME` (preferred)
-   - `GITHUB_ORG` (optional; auto-used as `org:...` fallback)
-3. Run app
-   - `bun run start`
+Or run without installing:
+
+```bash
+bunx xdist
+```
+
+- **Chernobyl Heatmap**: Character-by-character scan animation for revealing historical data.
+- **Provider Tracking**: Support for GitHub Copilot, Anthropic, OpenAI, and more.
+- **Quota & Cost**: Track both usage limits (requests) and cost caps (USD).
+- **Theme Support**: Unified "success" (scanline) aesthetics.
+- **Auto-Config**: Prompt-based credential setup for new providers.
+  - `bun run start`
 
 The app will also create `.usage-limits.config.json` in your project folder for local settings and stored credentials.
 

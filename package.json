@@ -1,8 +1,12 @@
 {
-  "name": "usage-limits",
+  "name": "xdist",
+  "version": "0.1.0",
+  "description": "xDIST (Did I Ship Today?) - AI Usage & Limits Dashboard",
   "module": "index.ts",
   "type": "module",
-  "private": true,
+  "bin": {
+    "xdist": "./index.ts"
+  },
   "scripts": {
     "start": "bun run index.ts",
     "dev": "bun run --watch index.ts"

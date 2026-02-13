@@ -551,7 +551,7 @@ export async function run(): Promise<void> {
         flexDirection: "row",
         justifyContent: "space-between",
       },
-      Text({ content: t`${fg(theme.success)("DIST - Did I Ship Today?")}`, truncate: true }),
+      Text({ content: t`${fg(theme.success)("xDIST - Did I Ship Today?")}`, truncate: true }),
       Text({ content: refreshChunk, fg: theme.success, truncate: true }),
     );
   }
