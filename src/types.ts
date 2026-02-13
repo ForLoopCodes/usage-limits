@@ -2,11 +2,12 @@ export type AgentKey = "github-copilot" | "codex" | "claude" | "zai" | "minimax"
 
 export type BillingMode = "quota" | "payg";
 
-export type BarStyle = "solid" | "shaded" | "ascii" | "dots" | "pipe";
+export type BarStyle = "solid" | "shaded" | "ascii" | "dots" | "pipe" | "braille";
 
 export interface AgentConfig {
   enabled: boolean;
   billingMode: BillingMode;
+  accentColor?: string;
   token?: string;
   apiKey?: string;
   username?: string;
@@ -20,8 +21,12 @@ export interface AppConfig {
   theme: string;
   refreshSeconds: number;
   barStyle: BarStyle;
+  dashboardMetrics?: "req" | "cost" | "both";
+  showModeColumn?: boolean;
   selectedAgent: AgentKey;
   agents: Record<AgentKey, AgentConfig>;
+  // optional UI preference persisted across runs
+  detailPaneMode?: "sidebar" | "bottom" | "hidden";
 }
 
 export interface UsageBreakdownItem {

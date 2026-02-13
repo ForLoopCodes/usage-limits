@@ -8,6 +8,7 @@ const AGENT_KEYS: AgentKey[] = ["github-copilot", "codex", "claude", "zai", "min
 const agentConfigSchema = z.object({
   enabled: z.boolean(),
   billingMode: z.enum(["quota", "payg"]),
+  accentColor: z.string().optional(),
   token: z.string().optional(),
   apiKey: z.string().optional(),
   username: z.string().optional(),
@@ -17,12 +18,14 @@ const agentConfigSchema = z.object({
   manualCost: z.number().nonnegative().optional(),
 });
 
-const barStyleSchema = z.enum(["solid", "shaded", "ascii", "dots", "pipe"]);
+const barStyleSchema = z.enum(["solid", "shaded", "ascii", "dots", "pipe", "braille"]);
 
 const appConfigSchema = z.object({
   theme: z.string().min(1),
   refreshSeconds: z.number().int().min(1).max(86400),
   barStyle: barStyleSchema,
+  dashboardMetrics: z.enum(["req", "cost", "both"]).optional(),
+  showModeColumn: z.boolean().optional(),
   selectedAgent: z.enum(["github-copilot", "codex", "claude", "zai", "minimax", "vercel-ai"]),
   agents: z.object({
     "github-copilot": agentConfigSchema,
@@ -32,6 +35,7 @@ const appConfigSchema = z.object({
     minimax: agentConfigSchema,
     "vercel-ai": agentConfigSchema,
   }),
+  detailPaneMode: z.enum(["sidebar", "bottom", "hidden"]).optional(),
 });
 
 const CONFIG_FILE = ".usage-limits.config.json";
@@ -54,7 +58,10 @@ export function defaultConfig(): AppConfig {
     theme: "neon-night",
     refreshSeconds: 60,
     barStyle: defaultBarStyle,
+    dashboardMetrics: "both",
+    showModeColumn: true,
     selectedAgent: "github-copilot",
+    detailPaneMode: "sidebar",
     agents: {
       "github-copilot": { ...defaultAgentConfig("quota", true), monthlyLimit: 500 },
       codex: defaultAgentConfig("quota", false),

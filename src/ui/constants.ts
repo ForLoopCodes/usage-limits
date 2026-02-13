@@ -1,6 +1,6 @@
 import type { BarStyle } from "../types";
 
-export const BAR_STYLE_OPTIONS: BarStyle[] = ["solid", "shaded", "ascii", "dots", "pipe"];
+export const BAR_STYLE_OPTIONS: BarStyle[] = ["solid", "shaded", "ascii", "dots", "pipe", "braille"];
 
 export const REFRESH_PRESETS = [
   { seconds: 10, label: "10s" },
