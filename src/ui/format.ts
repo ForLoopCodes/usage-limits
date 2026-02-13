@@ -3,11 +3,12 @@ import type { BarStyle } from "../types";
 export function toBar(
   progress: number,
   width: number,
-  style: BarStyle
+  style: BarStyle,
+  decimals = 0
 ): { fill: string; empty: string; percent: string } {
   const clampedProgress = Math.max(0, Math.min(1, progress));
   const filledWidth = Math.round(clampedProgress * width);
-  const percent = Math.round(clampedProgress * 100);
+  const percent = (clampedProgress * 100).toFixed(decimals) + "%";
 
   let fill: string;
   let empty: string;
@@ -40,7 +41,13 @@ export function toBar(
       const brailleForLevel = (level: number) => {
         // level: 0..8 -> set first `level` dots in BRAILLE_DOT_ORDER
         let bits = 0;
-        for (let i = 0; i < level; i++) bits |= 1 << (BRAILLE_DOT_ORDER[i] - 1);
+        for (let i = 0; i < level; i++) {
+          const dot = BRAILLE_DOT_ORDER[i];
+          if (typeof dot !== "number") {
+            continue;
+          }
+          bits |= 1 << (dot - 1);
+        }
         return String.fromCodePoint(0x2800 + bits);
       };
 

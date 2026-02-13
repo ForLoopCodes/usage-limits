@@ -2,7 +2,7 @@
 import { loadConfig, saveConfig } from "./config";
 import { getProvider, PROVIDERS } from "./providers";
 import { THEMES, getTheme, type ThemeDefinition } from "./themes";
-import type { AgentKey, AgentProvider, AgentSnapshot, BillingMode, Screen } from "./types";
+import type { AgentKey, AgentProvider, AgentSnapshot, BillingMode, DailyUsagePoint, HeatmapInfoMode, HeatmapScope, Screen } from "./types";
 import { BAR_STYLE_OPTIONS, REFRESH_PRESETS, SETTINGS_PAGES } from "./ui/constants";
 import { toBar } from "./ui/format";
 
@@ -11,7 +11,22 @@ const DEFAULT_AGENT: AgentKey = "github-copilot";
 type DetailPaneMode = "sidebar" | "bottom" | "hidden";
 type SettingsPageKey = (typeof SETTINGS_PAGES)[number]["key"];
 type ModelFieldKey = "enabled" | "billingMode" | "credential" | "accentColor" | "username" | "monthlyLimit" | "costLimit" | "manualUsed" | "manualCost";
-type UiRowKey = "theme" | "barStyle" | "refreshSeconds" | "detailPaneMode" | "dashboardMetrics" | "showModeColumn";
+type UiRowKey =
+  | "theme"
+  | "barStyle"
+  | "refreshSeconds"
+  | "detailPaneMode"
+  | "dashboardMetrics"
+  | "showModeColumn"
+  | "heatmapScope"
+  | "heatmapProvider"
+  | "heatmapMetric"
+  | "heatmapChars"
+  | "heatmapCellWidth"
+  | "heatmapInfoMode"
+  | "heatmapPaletteSteps"
+  | "heatmapMaxDays"
+  | "decimalPlaces";
 
 // Locally extend AppConfig to include detailPaneMode field
 type AppConfigWithDetailPane = ReturnType<typeof loadConfig> & { detailPaneMode?: DetailPaneMode };
@@ -58,6 +73,7 @@ interface AppState {
   refreshing: boolean;
   lastUpdatedAt: string;
   refreshTimer: Timer | null;
+  animationFrame: number;
   resizeWatchTimer: Timer | null;
   statusLine: string;
   shuttingDown: boolean;
@@ -74,7 +90,7 @@ function fieldDescription(field: ModelFieldKey): string {
     case "accentColor":
       return "Custom color for this provider row";
     case "username":
-      return "Account handle used for billing API";
+      return "Username for billing usage API (or org:slug)";
     case "monthlyLimit":
       return "Usage budget cap";
     case "costLimit":
@@ -104,6 +120,9 @@ function blankSnapshot(provider: AgentProvider, enabled: boolean, billingMode: B
     progress: 0,
     details: [provider.description],
     breakdown: [],
+    daily: [],
+    fetchedMonths: 0,
+    revealCursor: 0,
     fetchedAt: undefined,
   };
 }
@@ -116,6 +135,11 @@ function createInitialSnapshots(): Record<AgentKey, AgentSnapshot> {
     zai: blankSnapshot(getProvider("zai"), false, "quota"),
     minimax: blankSnapshot(getProvider("minimax"), false, "quota"),
     "vercel-ai": blankSnapshot(getProvider("vercel-ai"), false, "payg"),
+    ollama: blankSnapshot(getProvider("ollama"), false, "payg"),
+    openrouter: blankSnapshot(getProvider("openrouter"), false, "payg"),
+    cursor: blankSnapshot(getProvider("cursor"), false, "payg"),
+    antigravity: blankSnapshot(getProvider("antigravity"), false, "payg"),
+    opencode: blankSnapshot(getProvider("opencode"), false, "payg"),
   };
 }
 
@@ -155,6 +179,11 @@ export async function run(): Promise<void> {
       zai: false,
       minimax: false,
       "vercel-ai": false,
+      ollama: false,
+      openrouter: false,
+      cursor: false,
+      antigravity: false,
+      opencode: false,
     },
     prompt: null,
     promptCursorVisible: true,
@@ -165,10 +194,39 @@ export async function run(): Promise<void> {
     refreshing: false,
     lastUpdatedAt: "--:--:--",
     refreshTimer: null,
+    animationFrame: 0,
     resizeWatchTimer: null,
     statusLine: "ready",
     shuttingDown: false,
   };
+
+  setInterval(() => {
+    let needsRedraw = false;
+    let isAnySweeping = false;
+
+    // Sweep reveal cursors for all snapshots
+    for (const key of providerOrder) {
+      const snap = state.snapshots[key];
+      const heatmapCellWidth = clamp(state.config.heatmapCellWidth ?? 1, 1, 4);
+
+      const targetCursor = Math.floor((snap.fetchedMonths ?? 0) * 4.3452 * heatmapCellWidth);
+
+      if ((snap.revealCursor ?? 0) < targetCursor) {
+        snap.revealCursor = (snap.revealCursor ?? 0) + 1;
+        needsRedraw = true;
+        isAnySweeping = true;
+      }
+    }
+
+    if (state.refreshing || isAnySweeping) {
+      state.animationFrame = (state.animationFrame + 1) % 1000;
+      needsRedraw = true;
+    }
+
+    if (needsRedraw) {
+      redraw();
+    }
+  }, 50);
 
   const providerOrder = PROVIDERS.map((provider) => provider.key);
   const APP_PAD_X = 2;
@@ -209,23 +267,19 @@ export async function run(): Promise<void> {
     return keys[state.dashboardSelection];
   }
 
-  function usageCell(key: AgentKey): string {
+  function getUsageParts(key: AgentKey): { used: string; max: string } {
     const snapshot = state.snapshots[key];
     const cfg = state.config.agents[key];
-
-    // show plain numbers for requests in the dashboard (e.g. `50/300`),
-    // but keep unit for non-request units
     const used = snapshot.unit === "req" ? formatNumber(snapshot.used) : `${formatNumber(snapshot.used)}${snapshot.unit}`;
-    const usageLimit = cfg.billingMode === "quota" ? (typeof cfg.monthlyLimit === "number" ? formatNumber(cfg.monthlyLimit) : "∞") : "∞";
-    return `${used}/${usageLimit}`;
+    const max = cfg.billingMode === "quota" ? (typeof cfg.monthlyLimit === "number" ? formatNumber(cfg.monthlyLimit) : "∞") : "∞";
+    return { used, max };
   }
 
-  function costCell(key: AgentKey): string {
+  function getCostParts(key: AgentKey): { current: string; max: string } {
     const snapshot = state.snapshots[key];
     const cfg = state.config.agents[key];
-
-    const limit = typeof cfg.costLimit === "number" ? formatMoney(cfg.costLimit) : "∞";
-    return `${formatMoney(snapshot.cost)}/${limit}`;
+    const max = typeof cfg.costLimit === "number" ? formatMoney(cfg.costLimit) : "∞";
+    return { current: formatMoney(snapshot.cost), max };
   }
 
   function openPrompt(prompt: PromptState): void {
@@ -310,6 +364,108 @@ export async function run(): Promise<void> {
     });
   }
 
+  function openAppTextPrompt(title: string, current: string | undefined, instructions: string[], onApply: (next: string | undefined) => void): void {
+    openPrompt({
+      providerKey: DEFAULT_AGENT,
+      title,
+      instructions,
+      value: current ?? "",
+      secret: false,
+      mode: "text",
+      onSubmit: (value) => {
+        const trimmed = value.trim();
+        onApply(trimmed.length > 0 ? trimmed : undefined);
+        save();
+        closePrompt();
+        redraw();
+      },
+    });
+  }
+
+  function toDayKey(date: Date): string {
+    return date.toISOString().slice(0, 10);
+  }
+
+  function fromDayKey(day: string): Date | null {
+    const parsed = new Date(`${day}T00:00:00Z`);
+    if (!Number.isFinite(parsed.getTime())) {
+      return null;
+    }
+    return parsed;
+  }
+
+  function normalizeDailyUsage(input: DailyUsagePoint[] | undefined): DailyUsagePoint[] {
+    const valid = (input ?? [])
+      .filter((item) => Number.isFinite(item.used) && Number.isFinite(item.cost) && Boolean(fromDayKey(item.day)))
+      .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    return valid;
+  }
+
+  function sumDailyUsageSeries(seriesList: DailyUsagePoint[][]): DailyUsagePoint[] {
+    const byDay = new Map<string, { used: number; cost: number }>();
+
+    for (const series of seriesList) {
+      for (const item of series) {
+        const current = byDay.get(item.day) ?? { used: 0, cost: 0 };
+        current.used += item.used;
+        current.cost += item.cost;
+        byDay.set(item.day, current);
+      }
+    }
+
+    return [...byDay.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([day, value]) => ({ day, used: value.used, cost: value.cost }));
+  }
+
+  function isoWeekNumber(date: Date): number {
+    const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+    const dayNum = d.getUTCDay() || 7;
+    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  }
+
+  function heatmapPalette(stepCount: number, accentColor: string, appBg: string): string[] {
+    const steps = clamp(stepCount, 2, 9);
+
+    const parseHex = (hex: string): [number, number, number] | null => {
+      const value = hex.trim().replace("#", "");
+      if (!/^[0-9a-fA-F]{6}$/.test(value)) {
+        return null;
+      }
+      const r = Number.parseInt(value.slice(0, 2), 16);
+      const g = Number.parseInt(value.slice(2, 4), 16);
+      const b = Number.parseInt(value.slice(4, 6), 16);
+      if (![r, g, b].every((v) => Number.isFinite(v))) {
+        return null;
+      }
+      return [r, g, b];
+    };
+
+    const toHex = (v: number): string => Math.round(clamp(v, 0, 255)).toString(16).padStart(2, "0");
+
+    const mix = (a: [number, number, number], b: [number, number, number], t: number): [number, number, number] => [
+      a[0] + (b[0] - a[0]) * t,
+      a[1] + (b[1] - a[1]) * t,
+      a[2] + (b[2] - a[2]) * t,
+    ];
+
+    const bg = parseHex(appBg) ?? [22, 27, 34];
+    const fg = parseHex(accentColor) ?? [57, 211, 83];
+
+    return Array.from({ length: steps }, (_, i) => {
+      const t = steps <= 1 ? 1 : i / (steps - 1);
+      const [r, g, b] = mix(bg, fg, 0.12 + t * 0.88);
+      return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+    });
+  }
+
+  function pickHeatmapChar(charSet: string): string {
+    const source = Array.from((charSet || "⣿").trim());
+    return source[0] ?? "⣿";
+  }
+
   function openCredentialPrompt(providerKey: AgentKey): void {
     const provider = getProvider(providerKey);
 
@@ -319,7 +475,7 @@ export async function run(): Promise<void> {
         title: provider.label,
         instructions: [
           "GitHub token: fine-grained PAT or GitHub App user token",
-          "Permission needed: Plan (read)",
+          "Permission needed: Plan (read) for users, Administration (read) for organizations",
           "Get token from GitHub Settings → Developer settings",
         ],
         value: "",
@@ -335,7 +491,7 @@ export async function run(): Promise<void> {
           openTextPrompt(
             providerKey,
             state.config.agents[providerKey].username,
-            ["Enter your GitHub username/handle", "This is used in /users/{username}/settings/billing/premium_request/usage"],
+            ["Enter your GitHub username/handle", "Used in /users/{username}/settings/billing/premium_request/usage (or org:slug for organizations)"],
             (next) => {
               state.config.agents[providerKey].username = next;
             },
@@ -383,24 +539,24 @@ export async function run(): Promise<void> {
     openCredentialPrompt(key);
   }
 
-  function buildHeader(theme: ThemeDefinition) {
+  function buildHeader(theme: ThemeDefinition, width: any = "100%") {
     const refreshChunk = `${formatRefresh(state.config.refreshSeconds)} ${state.lastUpdatedAt}`;
 
     return Box(
       {
-        width: "100%",
+        width: width,
         backgroundColor: theme.appBg,
-        paddingLeft: 1,
-        paddingRight: 1,
+        paddingLeft: width === "100%" ? 1 : 0,
+        paddingRight: width === "100%" ? 1 : 0,
         flexDirection: "row",
         justifyContent: "space-between",
       },
-      Text({ content: t`${fg(theme.warning)("USAGE LIMITS MONITOR")}`, truncate: true }),
+      Text({ content: t`${fg(theme.success)("DIST - Did I Ship Today?")}`, truncate: true }),
       Text({ content: refreshChunk, fg: theme.success, truncate: true }),
     );
   }
 
-  function buildCommandBar(theme: ThemeDefinition) {
+  function buildCommandBar(theme: ThemeDefinition, width: any = "100%") {
     const segments =
       state.screen === "dashboard"
         ? [
@@ -425,7 +581,7 @@ export async function run(): Promise<void> {
     const items = segments.flatMap(([key, label], index) => {
       const tail = index < segments.length - 1 ? [Text({ content: SEGMENT_GAP, fg: theme.muted })] : [];
       return [
-        Text({ content: key, fg: theme.warning }),
+        Text({ content: key, fg: theme.success }),
         Text({ content: ` ${label}`, fg: theme.muted }),
         ...tail,
       ];
@@ -436,12 +592,12 @@ export async function run(): Promise<void> {
 
     return Box(
       {
-        width: "100%",
+        width: width,
         backgroundColor: theme.appBg,
         flexDirection: "row",
-        justifyContent: "center",
-        paddingLeft: 1,
-        paddingRight: 1,
+        justifyContent: width === "100%" ? "center" : "flex-start",
+        paddingLeft: width === "100%" ? 1 : 0,
+        paddingRight: width === "100%" ? 1 : 0,
       },
       ...items,
     );
@@ -466,8 +622,8 @@ export async function run(): Promise<void> {
 
     // determine which metric columns should be shown (follow dashboard setting)
     const metrics = state.config.dashboardMetrics ?? "both";
-    const showReqCol = metrics === "both" || metrics === "req";
-    const showCostCol = metrics === "both" || metrics === "cost";
+    const showReqCol = (metrics === "both" || metrics === "req") && showReq;
+    const showCostCol = (metrics === "both" || metrics === "cost") && showCost;
 
     // start with conservative, model-first allocation so names don't truncate
     let modelCol = Math.max(MIN.model, Math.floor(paneWidth * (colPct?.modelPct ?? 0.65)));
@@ -499,12 +655,12 @@ export async function run(): Promise<void> {
       if (showCostCol) {
         parts.push(Box({ width: GAP }));
         const cText = cost.trim();
-        parts.push(Box({ width: costCol }, Text({ content: lastDetailCol === "cost" ? rfit(cText, costCol) : fit(cText, costCol), fg: color, truncate: true })));
+        parts.push(Box({ width: costCol }, Text({ content: fit(cText, costCol), fg: color, truncate: true })));
       }
 
       if (showReqCol) {
         parts.push(Box({ width: GAP }));
-        parts.push(Box({ width: reqCol }, Text({ content: lastDetailCol === "req" ? rfit(req, reqCol) : fit(req, reqCol), fg: color, truncate: true })));
+        parts.push(Box({ width: reqCol }, Text({ content: fit(req, reqCol), fg: color, truncate: true })));
       }
 
       return Box(
@@ -522,6 +678,207 @@ export async function run(): Promise<void> {
       return detailRow(item.label, `${formatNumber(item.used)}`, formatMoney(item.cost), c);
     });
 
+    // ----------------------
+    // Daily usage heatmap
+    // ----------------------
+    const selectedModel = snapshot.breakdown[0];
+    const heatmapMetric = state.config.heatmapMetric ?? "req";
+    const heatmapChars = (state.config.heatmapChars?.trim() || "⣿");
+    const heatmapCellWidth = clamp(state.config.heatmapCellWidth ?? 1, 1, 4);
+    const heatmapSteps = clamp(state.config.heatmapPaletteSteps ?? 7, 2, 9);
+    const heatmapMaxDays = clamp(state.config.heatmapMaxDays ?? 364, 7, 364);
+    const heatmapInfoMode: HeatmapInfoMode = state.config.heatmapInfoMode ?? "days";
+    const heatmapScope: HeatmapScope = state.config.heatmapScope ?? "focused";
+    const hp = state.config.heatmapProvider ?? DEFAULT_AGENT;
+    const configuredHeatmapProvider: AgentKey = (hp === ("all" as any) ? DEFAULT_AGENT : hp) as AgentKey;
+
+    const enabledSnapshots = providerOrder
+      .filter((providerKey) => state.config.agents[providerKey].enabled)
+      .map((providerKey) => state.snapshots[providerKey])
+      .filter((item): item is AgentSnapshot => Boolean(item));
+
+    const totalDaily = sumDailyUsageSeries(enabledSnapshots.map((item) => normalizeDailyUsage(item.daily)));
+
+    let graphDailyRaw: DailyUsagePoint[] = [];
+    let scopeAccent = theme.success;
+    let useQuotaPercent = false;
+    let quotaBase = 300;
+
+    if (heatmapScope === "total") {
+      graphDailyRaw = totalDaily;
+      scopeAccent = theme.success;
+      useQuotaPercent = false;
+    } else {
+      const resolvedProviderKey: AgentKey = (heatmapScope === "provider" ? configuredHeatmapProvider : key) as AgentKey;
+      const scopedSnapshot = state.snapshots[resolvedProviderKey] ?? snapshot;
+      graphDailyRaw = normalizeDailyUsage(scopedSnapshot.daily);
+      scopeAccent = scopedSnapshot.accent || theme.success;
+      quotaBase = Math.max(1, state.config.agents[resolvedProviderKey]?.monthlyLimit ?? 300);
+      useQuotaPercent = heatmapMetric === "req" && resolvedProviderKey === "github-copilot";
+    }
+
+    const graphDaily = useQuotaPercent
+      ? graphDailyRaw.map((item) => ({
+        ...item,
+        used: Number(((item.used / quotaBase) * 100).toFixed(1)),
+      }))
+      : graphDailyRaw;
+
+    // Calculate columns based on max days, then trim from left to fit paneWidth
+    const requestedCols = clamp(Math.ceil(heatmapMaxDays / 7), 1, 52);
+    const maxAvailableCols = Math.floor((paneWidth - 2) / heatmapCellWidth);
+    const cols = Math.min(requestedCols, maxAvailableCols);
+
+    const totalCells = cols * 7;
+    const palette = heatmapPalette(heatmapSteps, scopeAccent, theme.appBg);
+    const byDay = new Map(graphDaily.map((item) => [item.day, item]));
+
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const start = new Date(today);
+    start.setUTCDate(start.getUTCDate() - (totalCells - 1));
+
+    const grid: number[][] = Array.from({ length: 7 }, () => Array.from({ length: cols }, () => 0));
+    const yearMarkers: { col: number; year: number }[] = [];
+    const monthMarkers: { col: number; month: string }[] = [];
+    const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let lastYear = -1;
+    let lastMonth = -1;
+    let maxValue = 0;
+
+    for (let c = 0; c < cols; c += 1) {
+      const dMonth = new Date(start);
+      dMonth.setUTCDate(start.getUTCDate() + c * 7);
+      const currentYear = dMonth.getUTCFullYear();
+      const currentMonth = dMonth.getUTCMonth();
+
+      if (currentYear !== lastYear) {
+        yearMarkers.push({ col: c, year: currentYear });
+        lastYear = currentYear;
+      }
+
+      if (currentMonth !== lastMonth) {
+        monthMarkers.push({ col: c, month: MONTH_NAMES[currentMonth] || "" });
+        lastMonth = currentMonth;
+      }
+
+      for (let r = 0; r < 7; r += 1) {
+        const row = grid[r];
+        if (!row) {
+          continue;
+        }
+
+        const d = new Date(start);
+        d.setUTCDate(start.getUTCDate() + c * 7 + r);
+        const keyDay = toDayKey(d);
+        const day = byDay.get(keyDay);
+        const baseValue = heatmapMetric === "cost" ? (day?.cost ?? 0) : (day?.used ?? 0);
+        row[c] = Math.max(0, baseValue);
+        maxValue = Math.max(maxValue, row[c] ?? 0);
+      }
+    }
+
+    const dayLabels = ["S", "M", "T", "W", "T", "F", "S"];
+    const heatmapRows = Array.from({ length: 7 }, (_, r) => {
+      const cells: any[] = [];
+      const row = grid[r] ?? [];
+
+      // Left Day Label Column
+      cells.push(Box({ width: 2 }, Text({ content: dayLabels[r] ?? "", fg: theme.muted })));
+
+      for (let c = 0; c < cols; c += 1) {
+        const value = row[c] ?? 0;
+        const level = maxValue <= 0 ? 0 : Math.round((value / maxValue) * (heatmapSteps - 1));
+        const baseChar = pickHeatmapChar(heatmapChars);
+        const color = palette[level] ?? (palette[palette.length - 1] ?? theme.success);
+
+        for (let j = 0; j < heatmapCellWidth; j++) {
+          const charIndexFromLeft = c * heatmapCellWidth + j;
+          const charIndexFromRight = (cols * heatmapCellWidth) - 1 - charIndexFromLeft;
+
+          // Reveal character by character from the right (newest) towards the left (oldest)
+          const revealCursor = snapshot.revealCursor ?? 0;
+          const isStillLoading = snapshot.loading && charIndexFromRight > revealCursor;
+
+          if (isStillLoading) {
+            const frame = state.animationFrame;
+            // distance in characters from the reveal cursor
+            const distance = Math.abs(charIndexFromRight - revealCursor);
+            // Frontier is the "scanning" edge at the reveal cursor (wider for visible effect)
+            const isFrontier = distance < 3.0;
+
+            // Faster, more erratic noise for the "Chernobyl" effect
+            const noise = Math.abs(Math.sin(frame * (isFrontier ? 6.5 : 2.5) + c * 0.7 + r * 1.9 + j) * 10000) % 1;
+
+            // Random sparks/glints of color in the noise field
+            const isGlint = !isFrontier && noise > 0.85;
+
+            const glitchChars = [" ", ".", ":", "░", "·", "!", "×", "÷", "±", "·"];
+
+            const char = glitchChars[Math.floor(noise * glitchChars.length)] ?? " ";
+            // Use the brightest color from the palette for the frontier (the "scan line")
+            // palette[palette.length - 1] is the most intense level
+            const scanColor = palette[palette.length - 1] ?? scopeAccent;
+            const fg = (isFrontier || isGlint) ? scanColor : "#1a1a1a";
+            cells.push(Text({ content: char, fg }));
+          } else {
+            cells.push(Text({ content: baseChar, fg: color }));
+          }
+        }
+      }
+
+      return Box(
+        {
+          width: 2 + (cols * heatmapCellWidth),
+          flexDirection: "row",
+          height: 1,
+        },
+        ...cells
+      );
+    });
+
+    const yearRowParts: any[] = [Box({ width: 2 })];
+    let lastYPos = 2;
+    for (const marker of yearMarkers) {
+      const targetCol = 2 + marker.col * heatmapCellWidth;
+      const skip = targetCol - lastYPos;
+      if (skip > 0) {
+        yearRowParts.push(Box({ width: skip }));
+        lastYPos += skip;
+      }
+      yearRowParts.push(Text({ content: String(marker.year), fg: scopeAccent }));
+      lastYPos += String(marker.year).length;
+    }
+
+    const yearRow = Box(
+      { width: 2 + (cols * heatmapCellWidth), flexDirection: "row", height: 1 },
+      ...yearRowParts
+    );
+
+    const monthRowParts: any[] = [Box({ width: 2 })];
+    let lastMPos = 2; // Start after the initial Box({ width: 2 })
+    for (const marker of monthMarkers) {
+      const targetCol = 2 + marker.col * heatmapCellWidth;
+      const skip = targetCol - lastMPos;
+      if (skip > 0) {
+        monthRowParts.push(Box({ width: skip }));
+        lastMPos += skip;
+      }
+      monthRowParts.push(Text({ content: marker.month, fg: theme.muted }));
+      lastMPos += marker.month.length;
+    }
+
+    const monthRow = Box(
+      { width: 2 + (cols * heatmapCellWidth), flexDirection: "row", height: 1 },
+      ...monthRowParts
+    );
+
+    const legendGlyph = pickHeatmapChar(heatmapChars);
+    const legendSwatches = palette.map((color) => Text({ content: legendGlyph, fg: color }));
+
+    const todayStr = toDayKey(new Date());
+    const todayUsed = byDay.get(todayStr)?.used ?? 0;
+
     return Box(
       {
         width: paneWidth,
@@ -533,15 +890,39 @@ export async function run(): Promise<void> {
       },
       (function () {
         const headerLineParts: string[] = [];
-        const lastDetailCol: "model" | "cost" | "req" = showReqCol ? "req" : showCostCol ? "cost" : "model";
 
-        headerLineParts.push(fit("model", modelCol));
-        if (showCostCol) headerLineParts.push(" ".repeat(GAP) + (lastDetailCol === "cost" ? rfit("cost", costCol) : fit("cost", costCol)));
-        if (showReqCol) headerLineParts.push(" ".repeat(GAP) + (lastDetailCol === "req" ? rfit("req", reqCol) : fit("req", reqCol)));
+        headerLineParts.push(fit("Model", modelCol));
+        if (showCostCol) headerLineParts.push(" ".repeat(GAP) + fit("Cost", costCol));
+        if (showReqCol) headerLineParts.push(" ".repeat(GAP) + fit("Req", reqCol));
 
         return Box({ width: paneWidth }, Text({ content: headerLineParts.join(""), fg: theme.success, truncate: true }));
       })(),
       ...(modelRows.length > 0 ? modelRows : [detailRow("No model rows available", "", "", theme.muted)]),
+      Text({ content: "", fg: theme.text }),
+      Box(
+        {
+          width: paneWidth,
+          flexDirection: "column",
+          alignItems: "flex-start",
+        },
+        yearRow,
+        monthRow,
+        ...heatmapRows,
+      ),
+      Box(
+        {
+          width: paneWidth,
+          flexDirection: "row",
+          justifyContent: "space-between",
+        },
+        Text({ content: `Today: ${todayUsed.toFixed(2)}%`, fg: theme.muted }),
+        Box(
+          { flexDirection: "row" },
+          Text({ content: "Low ", fg: theme.muted }),
+          ...legendSwatches,
+          Text({ content: " High", fg: theme.muted }),
+        )
+      )
     );
   }
 
@@ -565,11 +946,11 @@ export async function run(): Promise<void> {
     const safeWidth = Math.max(5, Math.floor(totalWidth));
 
     const enabledColumns = [
-      { key: "provider" as const, weight: 22 },
+      { key: "provider" as const, weight: 20 },
       ...(options.showMode ? [{ key: "mode" as const, weight: 10 }] : []),
-      { key: "bar" as const, weight: 38 },
-      ...(options.showUsage ? [{ key: "usage" as const, weight: 15 }] : []),
-      ...(options.showCost ? [{ key: "cost" as const, weight: 15 }] : []),
+      { key: "bar" as const, weight: 44 },
+      ...(options.showUsage ? [{ key: "usage" as const, weight: 13 }] : []),
+      ...(options.showCost ? [{ key: "cost" as const, weight: 13 }] : []),
     ];
 
     const weightTotal = enabledColumns.reduce((sum, item) => sum + item.weight, 0);
@@ -638,18 +1019,24 @@ export async function run(): Promise<void> {
 
     const effectiveDetailMode = resolveEffectiveDetailPaneMode();
     const sideWidth = effectiveDetailMode === "sidebar" ? Math.min(44, Math.max(30, Math.floor(viewportWidth * 0.32))) : 0;
+    const SIDE_GAP = 4;
 
-    const availableTableWidth = Math.max(5, viewportWidth - 2 - (effectiveDetailMode === "sidebar" ? sideWidth : 0));
+    const availableTableWidth = Math.max(5, viewportWidth - 2 - (effectiveDetailMode === "sidebar" ? sideWidth + SIDE_GAP : 0));
 
+    const decimals = state.config.decimalPlaces ?? 0;
     // build textual previews for computing widest-cell widths
     const rowTexts = enabled.map((k) => {
       const s = state.snapshots[k];
+      const u = getUsageParts(k);
+      const c = getCostParts(k);
       return {
         provider: s.label,
         mode: s.billingMode === "payg" ? "PAYG" : "QUOTA",
-        percent: `${Math.round(s.progress * 100)}%`,
-        usage: usageCell(k),
-        cost: costCell(k),
+        percent: `${(s.progress * 100).toFixed(decimals)}%`,
+        usage: u.used,
+        usageMax: u.max,
+        cost: c.current,
+        costMax: c.max,
       };
     });
 
@@ -657,35 +1044,43 @@ export async function run(): Promise<void> {
       provider: "Provider".length,
       mode: "Mode".length,
       progress: "Progress".length,
-      usage: "Usage".length,
+      usage: "Used".length,
+      usageMax: "Max".length,
       cost: "Cost".length,
+      costMax: "Max".length,
     };
 
     const providerMax = Math.max(headerLens.provider, ...(rowTexts.map((r) => r.provider.length)));
     const modeMax = Math.max(headerLens.mode, ...(rowTexts.map((r) => r.mode.length)));
-    const percentMax = Math.max(headerLens.progress, ...(rowTexts.map((r) => r.percent.length)));
     const usageMax = Math.max(headerLens.usage, ...(rowTexts.map((r) => r.usage.length)));
+    const usageLimitMax = Math.max(headerLens.usageMax, ...(rowTexts.map((r) => r.usageMax.length)));
     const costMax = Math.max(headerLens.cost, ...(rowTexts.map((r) => r.cost.length)));
+    const costLimitMax = Math.max(headerLens.costMax, ...(rowTexts.map((r) => r.costMax.length)));
+
+    // calculate max width for % column separately
+    const percentColMax = Math.max("%".length, ...rowTexts.map(r => r.percent.length));
 
     // desired widths = widest content per column (with sensible minimums)
-    // make the progress bar a first-class column: give it a larger minimum so it stays readable
     const MIN = {
       provider: 8,
       mode: 4,
-      // keep the bar at least 12 chars or ~25% of the available table width (whichever is larger)
-      bar: Math.max(12, Math.floor(Math.max(6, availableTableWidth * 0.25))),
-      usage: 6,
-      cost: 6,
+      bar: Math.max(8, Math.floor(availableTableWidth * 0.15)),
+      percent: percentColMax,
+      usage: 5,
+      usageMax: 5,
+      cost: 5,
+      costMax: 5,
     };
 
-    const baseBar = Math.max(MIN.bar, Math.min(40, percentMax + 6)); // base bar width before scaling
     const desired = {
       provider: Math.max(MIN.provider, providerMax),
       mode: Math.max(MIN.mode, modeMax),
-      // make the progress bar ~10% longer for readability
-      bar: Math.ceil(baseBar * 1.1),
+      bar: Math.max(MIN.bar, 20),
+      percent: percentColMax,
       usage: Math.max(MIN.usage, usageMax),
+      usageMax: Math.max(MIN.usageMax, usageLimitMax),
       cost: Math.max(MIN.cost, costMax),
+      costMax: Math.max(MIN.costMax, costLimitMax),
     };
 
     // include only visible columns when totaling
@@ -693,24 +1088,29 @@ export async function run(): Promise<void> {
       provider: desired.provider,
       mode: showModeColumn ? desired.mode : 0,
       bar: desired.bar,
+      percent: desired.percent,
       usage: showUsageColumn ? desired.usage : 0,
+      usageMax: showUsageColumn ? desired.usageMax : 0,
       cost: showCostColumn ? desired.cost : 0,
+      costMax: showCostColumn ? desired.costMax : 0,
     };
 
     // spacing between visible table columns (added gap counted in width math)
     const COL_GAP = 2;
-    const visibleCols = 2 + (showModeColumn ? 1 : 0) + (showUsageColumn ? 1 : 0) + (showCostColumn ? 1 : 0);
+    const visibleCols = 2 + (showModeColumn ? 1 : 0) + 1 + (showUsageColumn ? 2 : 0) + (showCostColumn ? 2 : 0);
     const gapCount = Math.max(0, visibleCols - 1);
 
-    // shrink to fit availableTableWidth if necessary — preserve the progress bar where possible.
-    // shrink less-important columns first and only reduce `bar` as a last resort.
-    const totalWidth = () => widths.provider + widths.mode + widths.bar + widths.usage + widths.cost + gapCount * COL_GAP;
+    const totalWidth = () =>
+      widths.provider + widths.mode + widths.bar + widths.percent +
+      widths.usage + widths.usageMax + widths.cost + widths.costMax + gapCount * COL_GAP;
+
     let over = totalWidth() - availableTableWidth;
-    const shrinkOrder: Array<keyof typeof widths> = ["provider", "usage", "cost", "mode", "bar"];
+    const shrinkOrder: Array<keyof typeof widths> = ["provider", "usage", "usageMax", "cost", "costMax", "mode", "bar"];
 
     while (over > 0) {
       let reduced = false;
       for (const k of shrinkOrder) {
+        if (k === "percent" || widths[k] === 0) continue;
         const minForKey = MIN[k as keyof typeof MIN] ?? 1;
         if (widths[k] > minForKey) {
           widths[k] -= 1;
@@ -725,20 +1125,40 @@ export async function run(): Promise<void> {
     const colProvider = widths.provider;
     const colMode = widths.mode;
     const colBar = Math.max(1, widths.bar);
+    const colPercent = widths.percent;
     const colUsage = widths.usage;
+    const colUsageMax = widths.usageMax;
     const colCost = widths.cost;
-    const tableWidth = colProvider + (showModeColumn ? colMode : 0) + colBar + (showUsageColumn ? colUsage : 0) + (showCostColumn ? colCost : 0) + gapCount * COL_GAP;
+    const colCostMax = widths.costMax;
 
-    const lastVisibleColumn: "bar" | "usage" | "cost" = showCostColumn ? "cost" : showUsageColumn ? "usage" : "bar";
+    const tableWidth = totalWidth();
+
+    const totalContentWidth = effectiveDetailMode === "sidebar" ? (tableWidth + SIDE_GAP + sideWidth) : tableWidth;
 
     const headerRow = Box(
       { width: tableWidth, flexDirection: "row" },
-      Box({ width: colProvider }, Text({ content: fit("Provider", colProvider), fg: theme.warning, truncate: true })),
+      Box({ width: colProvider }, Text({ content: fit("Provider", colProvider), fg: theme.success, truncate: true })),
       Box({ width: COL_GAP }),
-      ...(showModeColumn ? [Box({ width: colMode }, Text({ content: fit("Mode", colMode), fg: theme.warning, truncate: true })), Box({ width: COL_GAP })] : []),
-      Box({ width: colBar }, Text({ content: lastVisibleColumn === "bar" ? rfit("Progress", colBar) : fit("Progress", colBar), fg: theme.warning, truncate: true })),
-      ...(showUsageColumn ? [Box({ width: COL_GAP }), Box({ width: colUsage }, Text({ content: lastVisibleColumn === "usage" ? rfit("Usage", colUsage) : fit("Usage", colUsage), fg: theme.warning, truncate: true }))] : []),
-      ...(showCostColumn ? [Box({ width: COL_GAP }), Box({ width: colCost }, Text({ content: lastVisibleColumn === "cost" ? rfit("Cost", colCost) : fit("Cost", colCost), fg: theme.warning, truncate: true }))] : []),
+      ...(showModeColumn ? [Box({ width: colMode }, Text({ content: fit("Mode", colMode), fg: theme.success, truncate: true })), Box({ width: COL_GAP })] : []),
+      Box({ width: colBar }, Text({ content: fit("Progress", colBar), fg: theme.success, truncate: true })),
+      Box({ width: COL_GAP }),
+      Box({ width: colPercent }, Text({ content: fit("%", colPercent), fg: theme.success, truncate: true })),
+      ...(showUsageColumn
+        ? [
+          Box({ width: COL_GAP }),
+          Box({ width: colUsage }, Text({ content: fit("Used", colUsage), fg: theme.success, truncate: true })),
+          Box({ width: COL_GAP }),
+          Box({ width: colUsageMax }, Text({ content: fit("Max", colUsageMax), fg: theme.success, truncate: true })),
+        ]
+        : []),
+      ...(showCostColumn
+        ? [
+          Box({ width: COL_GAP }),
+          Box({ width: colCost }, Text({ content: fit("Cost", colCost), fg: theme.success, truncate: true })),
+          Box({ width: COL_GAP }),
+          Box({ width: colCostMax }, Text({ content: fit("Max", colCostMax), fg: theme.success, truncate: true })),
+        ]
+        : []),
     );
 
     const rows = enabled.map((key, index) => {
@@ -746,60 +1166,48 @@ export async function run(): Promise<void> {
       const rowSelected = index === state.dashboardSelection;
       const rowColor = rowSelected ? snapshot.accent : theme.muted;
       const mode = snapshot.billingMode === "payg" ? "PAYG" : "QUOTA";
-      // compute percent string and ensure it sits at the RIGHT edge of the progress column
-      const percentStr = `${Math.round(snapshot.progress * 100)}%`;
-      if (colBar <= percentStr.length) {
-        // not enough room for a visual bar — right-align the percent inside the column
-        const bar = toBar(snapshot.progress, 0, state.config.barStyle);
-        const progress = percentStr.padStart(colBar, " ");
-        // use the small/right-aligned percent string
-        // (we return below using `progress` variable via closure)
 
-        // render row using right-aligned percent-only string
-        return Box(
-          {
-            width: tableWidth,
-            flexDirection: "row",
-            backgroundColor: "transparent",
-          },
-          Box({ width: colProvider },
-            Text({ content: fit(snapshot.label, colProvider), fg: rowColor, truncate: true }),
-          ),
-          ...(showModeColumn
-            ? [
-              Box({ width: colMode },
-                Text({ content: fit(mode, colMode), fg: rowColor, truncate: true }),
-              ),
-              Box({ width: COL_GAP }),
-            ]
-            : []),
-          Box({ width: colBar },
-            Text({ content: lastVisibleColumn === "bar" ? rfit(progress, colBar) : fit(progress, colBar), fg: rowColor, truncate: true }),
-          ),
-          ...(showUsageColumn
-            ? [
-              Box({ width: COL_GAP }),
-              Box({ width: colUsage },
-                Text({ content: lastVisibleColumn === "usage" ? rfit(usageCell(key), colUsage) : fit(usageCell(key), colUsage), fg: rowColor, truncate: true }),
-              ),
-            ]
-            : []),
-          ...(showCostColumn
-            ? [
-              Box({ width: COL_GAP }),
-              Box({ width: colCost },
-                Text({ content: lastVisibleColumn === "cost" ? rfit(costCell(key), colCost) : fit(costCell(key), colCost), fg: rowColor, truncate: true }),
-              ),
-            ]
-            : []),
-        );
+      const decimals = state.config.decimalPlaces ?? 0;
+      const percentStr = `${(snapshot.progress * 100).toFixed(decimals)}%`;
+      const usage = getUsageParts(key);
+      const cost = getCostParts(key);
+
+      // The visual bar now uses the dedicated `colBar` width.
+      const barInnerWidth = colBar;
+      let progressStr = "";
+
+      if (snapshot.loading) {
+        // Wave-style animations from left to right
+        const frame = state.animationFrame;
+        const style = state.config.barStyle;
+        const width = barInnerWidth;
+
+        let anim = "";
+        for (let i = 0; i < width; i++) {
+          const phase = (frame - i);
+          if (style === "braille") {
+            const blocks = ["⡀", "⡄", "⡆", "⡇", "⣇", "⣧", "⣷", "⣿", "⣷", "⣧", "⣇", "⡇", "⡆", "⡄"];
+            const idx = ((phase % blocks.length) + blocks.length) % blocks.length;
+            anim += blocks[idx] || " ";
+          } else if (style === "dots") {
+            const blocks = ["⠐", "⠠", "⢀", "⡀", "⠄", "⠂", "⠁", "⠈"];
+            const idx = ((phase % blocks.length) + blocks.length) % blocks.length;
+            anim += blocks[idx] || " ";
+          } else if (style === "solid" || style === "shaded") {
+            const blocks = ["░", "▒", "▓", "█", "▓", "▒"];
+            const idx = ((phase % blocks.length) + blocks.length) % blocks.length;
+            anim += blocks[idx] || " ";
+          } else {
+            const blocks = ["-", "\\", "|", "/"];
+            const idx = ((phase % blocks.length) + blocks.length) % blocks.length;
+            anim += blocks[idx] || " ";
+          }
+        }
+        progressStr = anim;
+      } else {
+        const bar = toBar(snapshot.progress, barInnerWidth, state.config.barStyle, decimals);
+        progressStr = `${bar.fill}${bar.empty}`;
       }
-
-      // otherwise reserve exactly `percentStr.length` characters for the percentage
-      // account for the added space before the percent so the overall string equals `colBar`
-      const barInnerWidth = Math.max(0, colBar - percentStr.length - 1);
-      const bar = toBar(snapshot.progress, barInnerWidth, state.config.barStyle);
-      const progress = `${bar.fill}${bar.empty} ${bar.percent}`;
 
       return Box(
         {
@@ -819,15 +1227,24 @@ export async function run(): Promise<void> {
             Box({ width: COL_GAP }),
           ]
           : []),
-        // keep the progress column background-transparent so the bar sits on appBg
+        // Visual bar column
         Box({ width: colBar },
-          Text({ content: lastVisibleColumn === "bar" ? rfit(progress, colBar) : fit(progress, colBar), fg: rowColor, truncate: true }),
+          Text({ content: progressStr, fg: rowColor, truncate: true }),
+        ),
+        Box({ width: COL_GAP }),
+        // Percentage column - strictly right-aligned to match the header
+        Box({ width: colPercent },
+          Text({ content: fit(percentStr, colPercent), fg: rowColor, truncate: true }),
         ),
         ...(showUsageColumn
           ? [
             Box({ width: COL_GAP }),
             Box({ width: colUsage },
-              Text({ content: lastVisibleColumn === "usage" ? rfit(usageCell(key), colUsage) : fit(usageCell(key), colUsage), fg: rowColor, truncate: true }),
+              Text({ content: fit(usage.used, colUsage), fg: rowColor, truncate: true }),
+            ),
+            Box({ width: COL_GAP }),
+            Box({ width: colUsageMax },
+              Text({ content: fit(usage.max, colUsageMax), fg: rowColor, truncate: true }),
             ),
           ]
           : []),
@@ -835,7 +1252,11 @@ export async function run(): Promise<void> {
           ? [
             Box({ width: COL_GAP }),
             Box({ width: colCost },
-              Text({ content: lastVisibleColumn === "cost" ? rfit(costCell(key), colCost) : fit(costCell(key), colCost), fg: rowColor, truncate: true }),
+              Text({ content: fit(cost.current, colCost), fg: rowColor, truncate: true }),
+            ),
+            Box({ width: COL_GAP }),
+            Box({ width: colCostMax },
+              Text({ content: fit(cost.max, colCostMax), fg: rowColor, truncate: true }),
             ),
           ]
           : []),
@@ -889,8 +1310,11 @@ export async function run(): Promise<void> {
           backgroundColor: theme.appBg,
           paddingLeft: 1,
           paddingRight: 1,
+          alignItems: "center",
           justifyContent: "center",
         },
+        buildHeader(theme, totalContentWidth),
+        Box({ height: 1 }),
         compactTableBlock,
         Box(
           {
@@ -911,19 +1335,39 @@ export async function run(): Promise<void> {
             showCostColumn,
           ),
         ),
+        Box({ height: 1 }),
+        buildCommandBar(theme, totalContentWidth),
       );
     }
 
     return Box(
       {
         flexGrow: 1,
-        flexDirection: "row",
+        flexDirection: "column",
         backgroundColor: theme.appBg,
-        paddingLeft: 1,
-        paddingRight: 1,
+        alignItems: "center",
+        justifyContent: "center",
       },
-      tableColumn,
-      buildDetailPane(theme, selectedKey, sideWidth, undefined, showUsageColumn, showCostColumn),
+      buildHeader(theme, totalContentWidth),
+      Box({ height: 1 }),
+      Box(
+        {
+          flexDirection: "row",
+          alignItems: "flex-start",
+        },
+        Box(
+          {
+            flexDirection: "column",
+            alignItems: "center",
+          },
+          headerRow,
+          ...rows,
+        ),
+        Box({ width: SIDE_GAP }),
+        buildDetailPane(theme, selectedKey, sideWidth, undefined, showUsageColumn, showCostColumn),
+      ),
+      Box({ height: 1 }),
+      buildCommandBar(theme, totalContentWidth),
     );
   }
 
@@ -954,19 +1398,20 @@ export async function run(): Promise<void> {
 
     switch (field) {
       case "enabled":
-        return cfg.enabled ? "ON" : "OFF";
+        return cfg.enabled ? "On" : "Off";
       case "billingMode":
-        return `◀ ${cfg.billingMode.toUpperCase()} ▶`;
+        const bm = cfg.billingMode.charAt(0).toUpperCase() + cfg.billingMode.slice(1);
+        return `◀ ${bm} ▶`;
       case "credential":
-        return provider.isConfigured(cfg) ? "CONFIGURED" : "EDIT";
+        return provider.isConfigured(cfg) ? "Configured" : "Edit";
       case "accentColor":
         return cfg.accentColor?.trim() ? cfg.accentColor : provider.accent;
       case "username":
-        return cfg.username?.trim() ? cfg.username : "UNSET";
+        return cfg.username?.trim() ? cfg.username : "Unset";
       case "monthlyLimit":
-        return `◀ ${typeof cfg.monthlyLimit === "number" ? formatNumber(cfg.monthlyLimit) : "NONE"} ▶`;
+        return `◀ ${typeof cfg.monthlyLimit === "number" ? formatNumber(cfg.monthlyLimit) : "None"} ▶`;
       case "costLimit":
-        return `◀ ${typeof cfg.costLimit === "number" ? formatMoney(cfg.costLimit) : "NONE"} ▶`;
+        return `◀ ${typeof cfg.costLimit === "number" ? formatMoney(cfg.costLimit) : "None"} ▶`;
       case "manualUsed":
         return `◀ ${typeof cfg.manualUsed === "number" ? formatNumber(cfg.manualUsed) : "0"} ▶`;
       case "manualCost":
@@ -981,21 +1426,21 @@ export async function run(): Promise<void> {
       case "enabled":
         return "Enabled";
       case "billingMode":
-        return "Billing mode";
+        return "Billing Mode";
       case "credential":
         return "Credential";
       case "accentColor":
-        return "Provider color";
+        return "Provider Color";
       case "username":
         return "Username";
       case "monthlyLimit":
-        return "Monthly limit";
+        return "Monthly Limit";
       case "costLimit":
-        return "Cost limit";
+        return "Cost Limit";
       case "manualUsed":
-        return "Manual usage";
+        return "Manual Usage";
       case "manualCost":
-        return "Manual cost";
+        return "Manual Cost";
       default:
         return "";
     }
@@ -1055,9 +1500,9 @@ export async function run(): Promise<void> {
         width: "100%",
         flexDirection: "row",
       },
-      Text({ content: fit("Setting", titleWidth), fg: theme.warning, truncate: true }),
-      Text({ content: fit("Description", descriptionWidth), fg: theme.warning, truncate: true }),
-      Text({ content: fit("Control", controlWidth), fg: theme.warning, truncate: true }),
+      Text({ content: fit("Setting", titleWidth), fg: theme.success, truncate: true }),
+      Text({ content: fit("Description", descriptionWidth), fg: theme.success, truncate: true }),
+      Text({ content: fit("Control", controlWidth), fg: theme.success, truncate: true }),
     );
 
     const rendered = rows.map((row, index) => {
@@ -1066,7 +1511,7 @@ export async function run(): Promise<void> {
       if (row.kind === "provider") {
         const expanded = state.expandedProviders[row.providerKey];
         const snapshot = state.snapshots[row.providerKey];
-        const control = formatControl(`${snapshot.enabled ? "ON" : "OFF"} • ${expanded ? "OPEN" : "CLOSED"}`, controlWidth);
+        const control = formatControl(`${snapshot.enabled ? "On" : "Off"} • ${expanded ? "Open" : "Closed"}`, controlWidth);
 
         return Box(
           {
@@ -1076,7 +1521,7 @@ export async function run(): Promise<void> {
           },
           Text({
             content: fit(`${expanded ? "▾" : "▸"} ${snapshot.label}`, titleWidth),
-            fg: selected ? theme.selectionText : theme.warning,
+            fg: selected ? theme.selectionText : theme.success,
             truncate: true,
           }),
           Text({
@@ -1130,7 +1575,23 @@ export async function run(): Promise<void> {
   }
 
   function buildUiSettingsPanel(theme: ThemeDefinition, contentWidth: number) {
-    const rows: UiRowKey[] = ["theme", "barStyle", "refreshSeconds", "detailPaneMode", "dashboardMetrics", "showModeColumn"];
+    const rows: UiRowKey[] = [
+      "theme",
+      "barStyle",
+      "refreshSeconds",
+      "detailPaneMode",
+      "dashboardMetrics",
+      "showModeColumn",
+      "heatmapScope",
+      "heatmapProvider",
+      "heatmapMetric",
+      "heatmapChars",
+      "heatmapCellWidth",
+      "heatmapInfoMode",
+      "heatmapPaletteSteps",
+      "heatmapMaxDays",
+      "decimalPlaces",
+    ];
     state.uiSelection = clamp(state.uiSelection, 0, rows.length - 1);
 
     const { titleWidth, descriptionWidth, controlWidth } = settingsColumnWidths(contentWidth);
@@ -1140,9 +1601,9 @@ export async function run(): Promise<void> {
         width: "100%",
         flexDirection: "row",
       },
-      Text({ content: fit("Setting", titleWidth), fg: theme.warning, truncate: true }),
-      Text({ content: fit("Description", descriptionWidth), fg: theme.warning, truncate: true }),
-      Text({ content: fit("Control", controlWidth), fg: theme.warning, truncate: true }),
+      Text({ content: fit("Setting", titleWidth), fg: theme.success, truncate: true }),
+      Text({ content: fit("Description", descriptionWidth), fg: theme.success, truncate: true }),
+      Text({ content: fit("Control", controlWidth), fg: theme.success, truncate: true }),
     );
 
     const rendered = rows.map((row, index) => {
@@ -1189,6 +1650,63 @@ export async function run(): Promise<void> {
         value = formatControl(`◀ ${(state.config.showModeColumn ?? true) ? "ON" : "OFF"} ▶`, controlWidth);
       }
 
+      if (row === "heatmapScope") {
+        title = "Heatmap source";
+        description = "Focused provider, selected provider, or total";
+        value = formatControl(`◀ ${(state.config.heatmapScope ?? "focused").toUpperCase()} ▶`, controlWidth);
+      }
+
+      if (row === "heatmapProvider") {
+        title = "Heatmap provider";
+        description = "Pick provider (cycle or enter key manually)";
+        const pk = state.config.heatmapProvider ?? DEFAULT_AGENT;
+        const providerKey = (pk === ("all" as any) ? DEFAULT_AGENT : pk) as AgentKey;
+        const providerLabel = getProvider(providerKey).label;
+        value = formatControl(`◀ ${providerLabel} ▶`, controlWidth);
+      }
+
+      if (row === "heatmapMetric") {
+        title = "Heatmap metric";
+        description = "Daily graph tracks requests or cost";
+        value = formatControl(`◀ ${(state.config.heatmapMetric ?? "req").toUpperCase()} ▶`, controlWidth);
+      }
+
+      if (row === "heatmapChars") {
+        title = "Heatmap glyph";
+        description = "Single character used to draw graph cells";
+        value = formatControl(state.config.heatmapChars ?? "⣿", controlWidth);
+      }
+
+      if (row === "heatmapCellWidth") {
+        title = "Cell width";
+        description = "Repeat the glyph (1-4 characters wide)";
+        value = formatControl(`◀ ${state.config.heatmapCellWidth ?? 1} ▶`, controlWidth);
+      }
+
+      if (row === "heatmapInfoMode") {
+        title = "Heatmap labels";
+        description = "Show days, week, year, all, or none";
+        value = formatControl(`◀ ${(state.config.heatmapInfoMode ?? "days").toUpperCase()} ▶`, controlWidth);
+      }
+
+      if (row === "heatmapPaletteSteps") {
+        title = "Heatmap colors";
+        description = "Number of color levels in legend";
+        value = formatControl(`◀ ${state.config.heatmapPaletteSteps ?? 7} ▶`, controlWidth);
+      }
+
+      if (row === "heatmapMaxDays") {
+        title = "Heatmap max days";
+        description = "Cap history length (graph width follows)";
+        value = formatControl(`◀ ${state.config.heatmapMaxDays ?? 364} ▶`, controlWidth);
+      }
+
+      if (row === "decimalPlaces") {
+        title = "Decimal places";
+        description = "Number of decimals in progress %";
+        value = formatControl(`◀ ${state.config.decimalPlaces ?? 0} ▶`, controlWidth);
+      }
+
       return Box(
         {
           width: "100%",
@@ -1228,7 +1746,7 @@ export async function run(): Promise<void> {
         },
         Text({
           content: `${selected ? "▸" : " "} ${page.label}`,
-          fg: focused ? theme.selectionText : selected ? theme.warning : theme.text,
+          fg: focused ? theme.selectionText : selected ? theme.success : theme.text,
           truncate: true,
         }),
       );
@@ -1359,7 +1877,10 @@ export async function run(): Promise<void> {
       renderer.root.remove("app-root");
     }
 
-    const frameChildren = [buildHeader(theme), state.screen === "dashboard" ? buildDashboard(theme) : buildSettings(theme), buildCommandBar(theme)];
+    const frameChildren = state.screen === "dashboard"
+      ? [buildDashboard(theme)]
+      : [buildHeader(theme), buildSettings(theme), buildCommandBar(theme)];
+
     const rootChildren = [
       Box(
         {
@@ -1468,6 +1989,7 @@ export async function run(): Promise<void> {
           snapshot.cost = 0;
           snapshot.progress = 0;
           snapshot.breakdown = [];
+          snapshot.daily = normalizeDailyUsage(undefined);
           snapshot.details = ["disabled"];
           return;
         }
@@ -1480,13 +2002,29 @@ export async function run(): Promise<void> {
           snapshot.cost = 0;
           snapshot.progress = 0;
           snapshot.breakdown = [];
+          snapshot.daily = normalizeDailyUsage(undefined);
           snapshot.details = ["missing credentials"];
           return;
         }
 
         try {
           snapshot.loading = true;
-          const usage = await provider.fetchUsage(cfg);
+          snapshot.fetchedMonths = 0;
+          snapshot.revealCursor = 0;
+          const usage = await provider.fetchUsage(cfg, (partial) => {
+            if (partial.used !== undefined) snapshot.used = partial.used;
+            if (partial.cost !== undefined) snapshot.cost = partial.cost;
+            if (partial.breakdown !== undefined) snapshot.breakdown = partial.breakdown;
+            if (partial.daily !== undefined) snapshot.daily = normalizeDailyUsage(partial.daily);
+            if (partial.fetchedMonths !== undefined) snapshot.fetchedMonths = partial.fetchedMonths;
+            if (partial.limit !== undefined) {
+              snapshot.limit = partial.limit;
+              snapshot.progress = pickConfiguredProgress(cfg.billingMode, snapshot.used, partial.limit);
+            } else {
+              snapshot.progress = pickConfiguredProgress(cfg.billingMode, snapshot.used, snapshot.limit);
+            }
+            redraw();
+          });
           const limit = cfg.billingMode === "quota" ? usage.limit ?? cfg.monthlyLimit : undefined;
 
           snapshot.loading = false;
@@ -1497,6 +2035,8 @@ export async function run(): Promise<void> {
           snapshot.cost = usage.cost ?? 0;
           snapshot.progress = pickConfiguredProgress(cfg.billingMode, usage.used, limit);
           snapshot.breakdown = usage.breakdown ?? [];
+          snapshot.daily = normalizeDailyUsage(usage.daily);
+          snapshot.fetchedMonths = usage.fetchedMonths;
           snapshot.details = usage.details;
           snapshot.fetchedAt = formatClock(new Date());
         } catch (error) {
@@ -1504,6 +2044,7 @@ export async function run(): Promise<void> {
           snapshot.error = error instanceof Error ? error.message : String(error);
           snapshot.progress = 0;
           snapshot.breakdown = [];
+          snapshot.daily = normalizeDailyUsage(undefined);
           snapshot.details = ["fetch failed"];
         }
       }),
@@ -1754,6 +2295,93 @@ export async function run(): Promise<void> {
     redraw();
   }
 
+  function changeHeatmapScope(direction: 1 | -1): void {
+    const order: HeatmapScope[] = ["focused", "provider", "total"];
+    const current = state.config.heatmapScope ?? "focused";
+    const idx = Math.max(0, order.findIndex((item) => item === current));
+    const next = order[cycleIndex(order.length, idx, direction)];
+    if (!next) {
+      return;
+    }
+
+    state.config.heatmapScope = next;
+    save();
+    redraw();
+  }
+
+  function changeHeatmapProvider(direction: 1 | -1): void {
+    const list: Array<AgentKey> = [...providerOrder];
+    const current = state.config.heatmapProvider ?? DEFAULT_AGENT;
+    // ensure current is a valid AgentKey (not 'all' from old config)
+    const safeCurrent = (current === ("all" as any)) ? DEFAULT_AGENT : current;
+    const idx = Math.max(0, list.findIndex((item) => item === safeCurrent));
+    const next = list[cycleIndex(list.length, idx, direction)];
+    if (!next) {
+      return;
+    }
+
+    state.config.heatmapProvider = next;
+    save();
+    redraw();
+  }
+
+  function changeHeatmapMetric(direction: 1 | -1): void {
+    const order: Array<"req" | "cost"> = ["req", "cost"];
+    const current = state.config.heatmapMetric ?? "req";
+    const idx = Math.max(0, order.findIndex((item) => item === current));
+    const next = order[cycleIndex(order.length, idx, direction)];
+    if (!next) {
+      return;
+    }
+
+    state.config.heatmapMetric = next;
+    save();
+    redraw();
+  }
+
+  function changeHeatmapInfoMode(direction: 1 | -1): void {
+    const order: HeatmapInfoMode[] = ["none", "days", "week", "year", "all"];
+    const current = state.config.heatmapInfoMode ?? "days";
+    const idx = Math.max(0, order.findIndex((item) => item === current));
+    const next = order[cycleIndex(order.length, idx, direction)];
+    if (!next) {
+      return;
+    }
+
+    state.config.heatmapInfoMode = next;
+    save();
+    redraw();
+  }
+
+  function changeHeatmapPaletteSteps(direction: 1 | -1): void {
+    const current = state.config.heatmapPaletteSteps ?? 7;
+    state.config.heatmapPaletteSteps = clamp(current + direction, 2, 9);
+    save();
+    redraw();
+  }
+
+  function changeHeatmapCellWidth(direction: 1 | -1): void {
+    const current = state.config.heatmapCellWidth ?? 1;
+    state.config.heatmapCellWidth = clamp(current + direction, 1, 4);
+    save();
+    redraw();
+  }
+
+  function changeHeatmapMaxDays(direction: 1 | -1): void {
+    const current = state.config.heatmapMaxDays ?? 364;
+    const step = 7;
+    state.config.heatmapMaxDays = clamp(current + direction * step, 7, 364);
+    save();
+    redraw();
+  }
+
+  function changeDecimalPlaces(direction: 1 | -1): void {
+    const current = state.config.decimalPlaces ?? 0;
+    state.config.decimalPlaces = clamp(current + direction, 0, 4);
+    save();
+    redraw();
+  }
+
   function toggleBillingMode(providerKey: AgentKey): void {
     state.config.agents[providerKey].billingMode = state.config.agents[providerKey].billingMode === "quota" ? "payg" : "quota";
     save();
@@ -1819,7 +2447,7 @@ export async function run(): Promise<void> {
       openTextPrompt(
         row.providerKey,
         cfg.username,
-        ["Set username/handle for this provider", "For GitHub use your account handle, not email"],
+        ["Set username/handle for this provider", "For organization endpoint, use org:YOUR_ORG_SLUG"],
         (next) => {
           cfg.username = next;
         },
@@ -1946,7 +2574,23 @@ export async function run(): Promise<void> {
   }
 
   function handleUiSettingsKeys(keyName: string): void {
-    const rows: UiRowKey[] = ["theme", "barStyle", "refreshSeconds", "detailPaneMode", "dashboardMetrics", "showModeColumn"];
+    const rows: UiRowKey[] = [
+      "theme",
+      "barStyle",
+      "refreshSeconds",
+      "detailPaneMode",
+      "dashboardMetrics",
+      "showModeColumn",
+      "heatmapScope",
+      "heatmapProvider",
+      "heatmapMetric",
+      "heatmapChars",
+      "heatmapCellWidth",
+      "heatmapInfoMode",
+      "heatmapPaletteSteps",
+      "heatmapMaxDays",
+      "decimalPlaces",
+    ];
     state.uiSelection = clamp(state.uiSelection, 0, rows.length - 1);
 
     if (keyName === "up" || keyName === "k") {
@@ -2030,6 +2674,127 @@ export async function run(): Promise<void> {
       if (["left", "right", "a", "d", "space", "enter", "return"].includes(keyName)) {
         toggleShowModeColumn();
       }
+      return;
+    }
+
+    if (row === "heatmapScope") {
+      if (keyName === "left" || keyName === "a") {
+        changeHeatmapScope(-1);
+        return;
+      }
+      if (["right", "d", "enter", "return"].includes(keyName)) {
+        changeHeatmapScope(1);
+      }
+      return;
+    }
+
+    if (row === "heatmapProvider") {
+      if (keyName === "left" || keyName === "a") {
+        changeHeatmapProvider(-1);
+        return;
+      }
+      if (["right", "d"].includes(keyName)) {
+        changeHeatmapProvider(1);
+        return;
+      }
+      if (["enter", "return", "e"].includes(keyName)) {
+        openAppTextPrompt(
+          "Heatmap provider",
+          state.config.heatmapProvider,
+          ["Enter provider key", "Examples: github-copilot, claude", "Use left/right to cycle providers quickly"],
+          (next) => {
+            const candidate = (next ?? "").trim().toLowerCase();
+            const found = providerOrder.find((item) => item === candidate);
+            if (!found) {
+              state.statusLine = "invalid provider key";
+              return;
+            }
+            state.config.heatmapProvider = found;
+          },
+        );
+      }
+      return;
+    }
+
+    if (row === "heatmapMetric") {
+      if (keyName === "left" || keyName === "a") {
+        changeHeatmapMetric(-1);
+        return;
+      }
+      if (["right", "d", "enter", "return"].includes(keyName)) {
+        changeHeatmapMetric(1);
+      }
+      return;
+    }
+
+    if (row === "heatmapChars") {
+      if (["enter", "return", "e"].includes(keyName)) {
+        openAppTextPrompt(
+          "Heatmap glyph",
+          state.config.heatmapChars,
+          ["Enter exactly one character (example: ⣿)", "Only the first character will be used"],
+          (next) => {
+            const source = Array.from((next ?? "").trim());
+            state.config.heatmapChars = source[0] ?? "⣿";
+          },
+        );
+      }
+      return;
+    }
+
+    if (row === "heatmapCellWidth") {
+      if (keyName === "left" || keyName === "a") {
+        changeHeatmapCellWidth(-1);
+        return;
+      }
+      if (["right", "d", "enter", "return"].includes(keyName)) {
+        changeHeatmapCellWidth(1);
+      }
+      return;
+    }
+
+    if (row === "heatmapInfoMode") {
+      if (keyName === "left" || keyName === "a") {
+        changeHeatmapInfoMode(-1);
+        return;
+      }
+      if (["right", "d", "enter", "return"].includes(keyName)) {
+        changeHeatmapInfoMode(1);
+      }
+      return;
+    }
+
+    if (row === "heatmapPaletteSteps") {
+      if (keyName === "left" || keyName === "a") {
+        changeHeatmapPaletteSteps(-1);
+        return;
+      }
+      if (["right", "d", "enter", "return"].includes(keyName)) {
+        changeHeatmapPaletteSteps(1);
+      }
+      return;
+    }
+
+    if (row === "heatmapMaxDays") {
+      if (keyName === "left" || keyName === "a") {
+        changeHeatmapMaxDays(-1);
+        return;
+      }
+      if (["right", "d", "enter", "return"].includes(keyName)) {
+        changeHeatmapMaxDays(1);
+      }
+      return;
+    }
+
+    if (row === "decimalPlaces") {
+      if (keyName === "left" || keyName === "a") {
+        changeDecimalPlaces(-1);
+        return;
+      }
+      if (["right", "d", "enter", "return"].includes(keyName)) {
+        changeDecimalPlaces(1);
+      }
+      return;
     }
   }
 
@@ -2169,7 +2934,6 @@ export async function run(): Promise<void> {
 
   restartAutoRefresh();
   redraw();
-  ensureFirstMissingConfigPrompt();
   await refreshUsage("startup");
 }
 

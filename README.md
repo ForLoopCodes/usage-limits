@@ -14,8 +14,9 @@ Built with:
 - Theme switching
 - Settings page with per-agent enable toggles
 - Prompt-based credential setup when an enabled provider is not configured
-- Live GitHub premium request usage via:
-  - `GET /users/{username}/settings/billing/premium_request/usage`
+- Live GitHub premium request billing usage via:
+  - `GET /users/{username}/settings/billing/premium_request/usage?year=YYYY&month=MM`
+  - `GET /organizations/{org}/settings/billing/premium_request/usage?year=YYYY&month=MM` (set identity as `org:YOUR_ORG`)
 - Pay-as-you-go mode support (full bar + cost display)
 
 ## Quick start
@@ -24,7 +25,8 @@ Built with:
    - `bun install`
 2. Fill `.env` (optional but recommended)
    - `GITHUB_TOKEN`
-   - `GITHUB_USERNAME`
+   - `GITHUB_USERNAME` (preferred)
+   - `GITHUB_ORG` (optional; auto-used as `org:...` fallback)
 3. Run app
    - `bun run start`
 
@@ -58,14 +60,15 @@ Settings:
 
 ## GitHub token notes
 
-For user-level premium request usage:
+For billing usage reports:
 
-- Endpoint requires a token with **Plan (read)** for user billing endpoints.
+- User endpoint typically needs **Plan (read)**.
+- Organization endpoint typically needs **Administration (read)** on the organization.
 - You can use:
   - Fine-grained PAT
   - GitHub App user access token
 
-If your Copilot usage is billed via organization/enterprise, adapt the provider to org or enterprise endpoints later.
+This app queries the monthly premium-request endpoint across the last 24 months, keeps model-level breakdown for the current month, and builds the graph from monthly trend points.
 
 ## Extending providers
 
